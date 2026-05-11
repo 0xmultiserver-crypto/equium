@@ -11,6 +11,8 @@
 
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use anchor_lang::prelude::AccountMeta;
@@ -58,9 +60,13 @@ struct Args {
     #[arg(long, default_value_t = 1_400_000u32)]
     cu_limit: u32,
 
-    /// Cap on nonce attempts per round before giving up and re-fetching state.
+    /// Cap on nonce attempts per worker before giving up and re-fetching state.
     #[arg(long, default_value_t = 4096u64)]
     max_nonces_per_round: u64,
+
+    /// Number of parallel solver workers. 0 = auto-detect CPU cores.
+    #[arg(long, default_value_t = 0usize)]
+    workers: usize,
 }
 
 // ANSI styling shortcuts. Colors are picked to look good against either a
@@ -94,7 +100,14 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
         .format(|buf, record| {
             use std::io::Write;
-            writeln!(buf, "{}{}{}  {}", C_GRAY, record.level(), C_RESET, record.args())
+            writeln!(
+                buf,
+                "{}{}{}  {}",
+                C_GRAY,
+                record.level(),
+                C_RESET,
+                record.args()
+            )
         })
         .init();
 
@@ -114,8 +127,13 @@ fn main() -> Result<()> {
     let (vault_pda, _) = Pubkey::find_program_address(&[VAULT_SEED], &program_id);
 
     let network_label = network_label_from_url(&args.rpc_url);
+    let worker_count = effective_worker_count(args.workers);
 
     print_boot(&miner, &program_id, network_label);
+    println!(
+        "   {}workers{}   {}{}{}",
+        C_DIM, C_RESET, C_TEAL, worker_count, C_RESET
+    );
 
     let mut blocks_mined = 0u64;
     let started_at = Instant::now();
@@ -127,9 +145,9 @@ fn main() -> Result<()> {
     let token_program_id = {
         let cfg = fetch_config(&rpc, &config_pda)
             .with_context(|| format!("fetch config at {}", config_pda))?;
-        let mint_acct = rpc.get_account(&cfg.mint).with_context(|| {
-            format!("fetch mint {} for token program detection", cfg.mint)
-        })?;
+        let mint_acct = rpc
+            .get_account(&cfg.mint)
+            .with_context(|| format!("fetch mint {} for token program detection", cfg.mint))?;
         mint_acct.owner
     };
     let mut current_height: u64 = u64::MAX;
@@ -157,9 +175,15 @@ fn main() -> Result<()> {
             println!();
             println!(
                 "   {}round #{}{}   {}reward {} EQM{}   {}target 0x{}…{}",
-                C_BOLD, cfg.block_height, C_RESET,
-                C_DIM, format_reward(cfg.current_epoch_reward), C_RESET,
-                C_DIM, hex::encode(&cfg.current_target[..4]), C_RESET,
+                C_BOLD,
+                cfg.block_height,
+                C_RESET,
+                C_DIM,
+                format_reward(cfg.current_epoch_reward),
+                C_RESET,
+                C_DIM,
+                hex::encode(&cfg.current_target[..4]),
+                C_RESET,
             );
             println!("{}{}{}", C_GRAY, RULE, C_RESET);
         }
@@ -184,7 +208,11 @@ fn main() -> Result<()> {
             match submit_advance_empty_round(&rpc, &miner_kp, &program_id, &config_pda) {
                 Ok(sig) => println!(
                     "     {}↳ advanced empty round{}   {}sig {}{}",
-                    C_SAGE, C_RESET, C_GRAY, short_sig(&sig), C_RESET
+                    C_SAGE,
+                    C_RESET,
+                    C_GRAY,
+                    short_sig(&sig),
+                    C_RESET
                 ),
                 Err(e) => {
                     let reason = if e.to_string().contains("RoundStillActive") {
@@ -201,51 +229,54 @@ fn main() -> Result<()> {
         }
 
         let solve_started = Instant::now();
-        let input = build_input(
-            &cfg.current_challenge,
-            &miner.to_bytes(),
-            cfg.block_height,
+        let input = build_input(&cfg.current_challenge, &miner.to_bytes(), cfg.block_height);
+        let solve_batch = solve_parallel_until_target(
+            cfg.equihash_n,
+            cfg.equihash_k,
+            input,
+            cfg.current_target,
+            args.max_nonces_per_round,
+            worker_count,
         );
-        let mut rng = rand::thread_rng();
-        let mut counter = 0u64;
-        let solution = solve(cfg.equihash_n, cfg.equihash_k, &input, || {
-            counter += 1;
-            if counter > args.max_nonces_per_round {
-                return None;
-            }
-            let mut nonce = [0u8; 32];
-            rng.fill_bytes(&mut nonce);
-            Some(nonce)
-        });
-
-        let solution = match solution {
-            Ok(s) => s,
-            Err(_) => {
-                println!("   {}solver gave up; refreshing{}", C_GRAY, C_RESET);
-                std::thread::sleep(Duration::from_millis(500));
-                continue;
-            }
-        };
         let solve_ms = solve_started.elapsed().as_millis() as u64;
-        try_in_round += 1;
-        total_nonces = total_nonces.saturating_add(counter);
+        total_nonces = total_nonces.saturating_add(solve_batch.attempts);
 
         let session_secs = started_at.elapsed().as_secs_f64().max(0.001);
         let hashrate = total_nonces as f64 / session_secs;
 
-        // Off-chain target check — saves an RPC roundtrip for solutions
-        // that the on-chain verifier would reject as AboveTarget.
-        let cand_hash = solution_hash(&solution.soln_indices, &input);
-        if !hash_under_target(&cand_hash, &cfg.current_target) {
-            println!(
-                "     {}· try #{}{}   {}above target{}        {}{}ms{}   {}{}{}",
-                C_GRAY, try_in_round, C_RESET,
-                C_DIM, C_RESET,
-                C_DIM, solve_ms, C_RESET,
-                C_GOLD, fmt_hashrate(hashrate), C_RESET,
-            );
-            continue;
-        }
+        let solution = match solve_batch.solution {
+            Some(s) => {
+                try_in_round = try_in_round.saturating_add(solve_batch.candidates.max(1));
+                s
+            }
+            None => {
+                if solve_batch.candidates > 0 {
+                    try_in_round = try_in_round.saturating_add(solve_batch.candidates);
+                    println!(
+                        "     {}· try #{}{}   {}above target x{}{}        {}{}ms{}   {}{}{}",
+                        C_GRAY,
+                        try_in_round,
+                        C_RESET,
+                        C_DIM,
+                        solve_batch.candidates,
+                        C_RESET,
+                        C_DIM,
+                        solve_ms,
+                        C_RESET,
+                        C_GOLD,
+                        fmt_hashrate(hashrate),
+                        C_RESET,
+                    );
+                } else {
+                    println!(
+                        "   {}solver gave up across {} workers; refreshing{}",
+                        C_GRAY, worker_count, C_RESET
+                    );
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                continue;
+            }
+        };
 
         match submit_mine(
             &rpc,
@@ -265,11 +296,20 @@ fn main() -> Result<()> {
                 total_reward_base = total_reward_base.saturating_add(cfg.current_epoch_reward);
                 println!(
                     "     {}✓ MINED!{}   {}+{} EQM{}     {}try #{}{}   {}{}ms{}   {}{}{}",
-                    C_SAGE_B, C_RESET,
-                    C_BOLD, format_reward(cfg.current_epoch_reward), C_RESET,
-                    C_DIM, try_in_round, C_RESET,
-                    C_DIM, solve_ms, C_RESET,
-                    C_GOLD_B, fmt_hashrate(hashrate), C_RESET,
+                    C_SAGE_B,
+                    C_RESET,
+                    C_BOLD,
+                    format_reward(cfg.current_epoch_reward),
+                    C_RESET,
+                    C_DIM,
+                    try_in_round,
+                    C_RESET,
+                    C_DIM,
+                    solve_ms,
+                    C_RESET,
+                    C_GOLD_B,
+                    fmt_hashrate(hashrate),
+                    C_RESET,
                 );
                 println!("       {}sig {}{}", C_GRAY, short_sig(&sig), C_RESET);
                 println!();
@@ -287,10 +327,18 @@ fn main() -> Result<()> {
                 let reason = classify_submit_err(&e.to_string());
                 println!(
                     "     {}· try #{}{}   {}{}{}        {}{}ms{}   {}{}{}",
-                    C_GRAY, try_in_round, C_RESET,
-                    C_DIM, reason, C_RESET,
-                    C_DIM, solve_ms, C_RESET,
-                    C_GOLD, fmt_hashrate(hashrate), C_RESET,
+                    C_GRAY,
+                    try_in_round,
+                    C_RESET,
+                    C_DIM,
+                    reason,
+                    C_RESET,
+                    C_DIM,
+                    solve_ms,
+                    C_RESET,
+                    C_GOLD,
+                    fmt_hashrate(hashrate),
+                    C_RESET,
                 );
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
@@ -302,13 +350,120 @@ fn main() -> Result<()> {
             println!();
             println!(
                 "   {}session complete{}  ·  {} blocks  ·  avg latency {:.1}s  ·  {}",
-                C_ROSE_B, C_RESET,
+                C_ROSE_B,
+                C_RESET,
                 args.max_blocks,
                 elapsed / blocks_mined as f64,
                 fmt_hashrate(hashrate),
             );
             return Ok(());
         }
+    }
+}
+
+struct SolveBatch {
+    solution: Option<equihash_core::solver::Solution>,
+    attempts: u64,
+    candidates: u32,
+}
+
+struct WorkerSolve {
+    solution: Option<equihash_core::solver::Solution>,
+    attempts: u64,
+    under_target: bool,
+}
+
+fn effective_worker_count(requested: usize) -> usize {
+    if requested > 0 {
+        return requested;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn solve_parallel_until_target(
+    n: u32,
+    k: u32,
+    input: [u8; equihash_core::challenge::I_LEN],
+    target: [u8; 32],
+    max_nonces_per_worker: u64,
+    workers: usize,
+) -> SolveBatch {
+    let workers = workers.max(1);
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel::<WorkerSolve>();
+    let mut handles = Vec::with_capacity(workers);
+
+    for worker_id in 0..workers {
+        let tx = tx.clone();
+        let stop = Arc::clone(&stop);
+        let input = input;
+        let target = target;
+        handles.push(std::thread::spawn(move || {
+            let mut rng = rand::thread_rng();
+            let mut counter = 0u64;
+            let solution = solve(n, k, &input, || {
+                if stop.load(Ordering::Relaxed) {
+                    return None;
+                }
+                counter += 1;
+                if counter > max_nonces_per_worker {
+                    return None;
+                }
+                let mut nonce = [0u8; 32];
+                rng.fill_bytes(&mut nonce);
+                let mixed = u64::from_le_bytes(nonce[..8].try_into().unwrap()) ^ worker_id as u64;
+                nonce[..8].copy_from_slice(&mixed.to_le_bytes());
+                Some(nonce)
+            })
+            .ok();
+
+            let under_target = solution
+                .as_ref()
+                .map(|s| {
+                    let cand_hash = solution_hash(&s.soln_indices, &input);
+                    hash_under_target(&cand_hash, &target)
+                })
+                .unwrap_or(false);
+
+            if under_target {
+                stop.store(true, Ordering::Relaxed);
+            }
+
+            let _ = tx.send(WorkerSolve {
+                solution,
+                attempts: counter,
+                under_target,
+            });
+        }));
+    }
+    drop(tx);
+
+    let mut attempts = 0u64;
+    let mut candidates = 0u32;
+    let mut winning_solution = None;
+
+    for msg in rx {
+        attempts = attempts.saturating_add(msg.attempts);
+        if msg.solution.is_some() {
+            candidates = candidates.saturating_add(1);
+        }
+        if msg.under_target && winning_solution.is_none() {
+            winning_solution = msg.solution;
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    SolveBatch {
+        solution: winning_solution,
+        attempts,
+        candidates,
     }
 }
 
@@ -320,9 +475,26 @@ fn print_boot(miner: &Pubkey, program: &Pubkey, network: &str) {
     );
     println!();
     println!("{}{}{}", C_GRAY, RULE, C_RESET);
-    println!("   {}miner{}     {}{}{}", C_DIM, C_RESET, C_TEAL, short_pk(miner), C_RESET);
-    println!("   {}program{}   {}{}{}", C_DIM, C_RESET, C_TEAL, short_pk(program), C_RESET);
-    println!("   {}network{}   {}{}{}", C_DIM, C_RESET, C_TEAL, network, C_RESET);
+    println!(
+        "   {}miner{}     {}{}{}",
+        C_DIM,
+        C_RESET,
+        C_TEAL,
+        short_pk(miner),
+        C_RESET
+    );
+    println!(
+        "   {}program{}   {}{}{}",
+        C_DIM,
+        C_RESET,
+        C_TEAL,
+        short_pk(program),
+        C_RESET
+    );
+    println!(
+        "   {}network{}   {}{}{}",
+        C_DIM, C_RESET, C_TEAL, network, C_RESET
+    );
     println!("{}{}{}", C_GRAY, RULE, C_RESET);
 }
 
@@ -378,7 +550,9 @@ fn format_reward(base_units: u64) -> String {
     if frac == 0 {
         format!("{}", whole)
     } else {
-        format!("{}.{:06}", whole, frac).trim_end_matches('0').to_string()
+        format!("{}.{:06}", whole, frac)
+            .trim_end_matches('0')
+            .to_string()
     }
 }
 
@@ -458,12 +632,7 @@ fn submit_mine(
     let cu_ix = ComputeBudgetInstruction::set_compute_unit_limit(cu_limit);
 
     let recent = rpc.get_latest_blockhash()?;
-    let tx = Transaction::new_signed_with_payer(
-        &[cu_ix, ix],
-        Some(&miner),
-        &[miner_kp],
-        recent,
-    );
+    let tx = Transaction::new_signed_with_payer(&[cu_ix, ix], Some(&miner), &[miner_kp], recent);
     let sig = rpc.send_and_confirm_transaction(&tx)?;
     Ok(sig.to_string())
 }
