@@ -40,10 +40,6 @@ fn cbits_of(n: u32, k: u32) -> usize {
     (n / (k + 1)) as usize
 }
 
-fn cbytes_of(n: u32, k: u32) -> usize {
-    cbits_of(n, k).div_ceil(8)
-}
-
 fn init_state(n: u32, k: u32, hash_output: u8) -> Blake2bState {
     let mut p = Vec::with_capacity(PERSONALBYTES);
     p.extend_from_slice(b"ZcashPoW");
@@ -55,14 +51,30 @@ fn init_state(n: u32, k: u32, hash_output: u8) -> Blake2bState {
         .to_state()
 }
 
-fn generate_leaf_hash(base: &Blake2bState, n: u32, i: u32) -> Vec<u8> {
+fn generate_initial_rows(base: &Blake2bState, n: u32, n_init: u32) -> Vec<Row> {
     let indices_per = (512 / n) as usize;
     let n_bytes = (n / 8) as usize;
-    let mut state = base.clone();
-    state.update(&(i / indices_per as u32).to_le_bytes());
-    let full = state.finalize();
-    let off = (i as usize % indices_per) * n_bytes;
-    full.as_bytes()[off..off + n_bytes].to_vec()
+    let group_count = (n_init as usize).div_ceil(indices_per);
+    let mut rows = Vec::with_capacity(n_init as usize);
+
+    for group in 0..group_count {
+        let mut state = base.clone();
+        state.update(&(group as u32).to_le_bytes());
+        let full = state.finalize();
+        let full_bytes = full.as_bytes();
+        let start = group * indices_per;
+        let end = ((group + 1) * indices_per).min(n_init as usize);
+
+        for i in start..end {
+            let off = (i % indices_per) * n_bytes;
+            rows.push(Row {
+                hash: full_bytes[off..off + n_bytes].to_vec(),
+                indices: vec![i as u32],
+            });
+        }
+    }
+
+    rows
 }
 
 fn first_cbits_eq(a: &[u8], b: &[u8], cbits: usize) -> bool {
@@ -78,8 +90,15 @@ fn first_cbits_eq(a: &[u8], b: &[u8], cbits: usize) -> bool {
     (a[full_bytes] & mask) == (b[full_bytes] & mask)
 }
 
-fn xor(a: &[u8], b: &[u8]) -> Vec<u8> {
-    a.iter().zip(b.iter()).map(|(x, y)| x ^ y).collect()
+fn xor_trim(a: &[u8], b: &[u8], trim: usize) -> Vec<u8> {
+    if a.len() <= trim {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(a.len() - trim);
+    for idx in trim..a.len() {
+        out.push(a[idx] ^ b[idx]);
+    }
+    out
 }
 
 /// Indices are stored in tree-concatenation order (NOT sorted), so the
@@ -119,7 +138,7 @@ fn round(rows: Vec<Row>, cbits: usize) -> Vec<Row> {
     let mut sorted = rows;
     sorted.sort_by(|a, b| a.hash.cmp(&b.hash));
 
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(sorted.len() / 2);
     let mut i = 0;
     while i < sorted.len() {
         let mut j = i + 1;
@@ -133,12 +152,7 @@ fn round(rows: Vec<Row>, cbits: usize) -> Vec<Row> {
                 if !distinct_indices(&a.indices, &b.indices) {
                     continue;
                 }
-                let xored = xor(&a.hash, &b.hash);
-                let new_hash = if xored.len() <= cbytes {
-                    Vec::new()
-                } else {
-                    xored[cbytes..].to_vec()
-                };
+                let new_hash = xor_trim(&a.hash, &b.hash, cbytes);
                 out.push(Row {
                     hash: new_hash,
                     indices: concat_canonical(&a.indices, &b.indices),
@@ -148,6 +162,154 @@ fn round(rows: Vec<Row>, cbits: usize) -> Vec<Row> {
         i = j;
     }
     out
+}
+
+#[derive(Clone)]
+struct Row96 {
+    hash: [u8; 60],
+    hash_len: usize,
+    indices: [u32; 32],
+    indices_len: usize,
+}
+
+fn generate_initial_rows_96(base: &Blake2bState) -> Vec<Row96> {
+    const N_INIT: usize = 1usize << 17;
+    const INDICES_PER: usize = 512 / 96;
+    const N_BYTES: usize = 96 / 8;
+    let group_count = N_INIT.div_ceil(INDICES_PER);
+    let mut rows = Vec::with_capacity(N_INIT);
+
+    for group in 0..group_count {
+        let mut state = base.clone();
+        state.update(&(group as u32).to_le_bytes());
+        let full = state.finalize();
+        let full_bytes = full.as_bytes();
+        let start = group * INDICES_PER;
+        let end = ((group + 1) * INDICES_PER).min(N_INIT);
+
+        for i in start..end {
+            let off = (i % INDICES_PER) * N_BYTES;
+            let mut hash = [0u8; 60];
+            hash[..N_BYTES].copy_from_slice(&full_bytes[off..off + N_BYTES]);
+            let mut indices = [0u32; 32];
+            indices[0] = i as u32;
+            rows.push(Row96 {
+                hash,
+                hash_len: N_BYTES,
+                indices,
+                indices_len: 1,
+            });
+        }
+    }
+
+    rows
+}
+
+fn first_cbits_eq_96(a: &Row96, b: &Row96) -> bool {
+    a.hash[0] == b.hash[0] && a.hash[1] == b.hash[1]
+}
+
+fn distinct_indices_96(a: &Row96, b: &Row96) -> bool {
+    for ia in 0..a.indices_len {
+        for ib in 0..b.indices_len {
+            if a.indices[ia] == b.indices[ib] {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn merge_rows_96(a: &Row96, b: &Row96) -> Row96 {
+    let new_hash_len = a.hash_len.saturating_sub(2);
+    let mut hash = [0u8; 60];
+    for idx in 0..new_hash_len {
+        hash[idx] = a.hash[idx + 2] ^ b.hash[idx + 2];
+    }
+
+    let mut indices = [0u32; 32];
+    let (first, second) = if a.indices[0] < b.indices[0] {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    indices[..first.indices_len].copy_from_slice(&first.indices[..first.indices_len]);
+    indices[first.indices_len..first.indices_len + second.indices_len]
+        .copy_from_slice(&second.indices[..second.indices_len]);
+
+    Row96 {
+        hash,
+        hash_len: new_hash_len,
+        indices,
+        indices_len: a.indices_len + b.indices_len,
+    }
+}
+
+fn round_96(rows: Vec<Row96>) -> Vec<Row96> {
+    let mut sorted = rows;
+    sorted.sort_unstable_by_key(|row| u16::from_be_bytes([row.hash[0], row.hash[1]]));
+
+    let mut out = Vec::with_capacity(sorted.len() / 2);
+    let mut i = 0;
+    while i < sorted.len() {
+        let mut j = i + 1;
+        while j < sorted.len() && first_cbits_eq_96(&sorted[i], &sorted[j]) {
+            j += 1;
+        }
+        for ia in i..j {
+            for ib in (ia + 1)..j {
+                let a = &sorted[ia];
+                let b = &sorted[ib];
+                if distinct_indices_96(a, b) {
+                    out.push(merge_rows_96(a, b));
+                }
+            }
+        }
+        i = j;
+    }
+    out
+}
+
+fn solve_96_5<F>(input: &[u8; I_LEN], mut next_nonce: F) -> Result<Solution, SolveError>
+where
+    F: FnMut() -> Option<[u8; 32]>,
+{
+    let mut base_state = init_state(96, 5, hash_output_len(96) as u8);
+    base_state.update(input);
+
+    loop {
+        let nonce = match next_nonce() {
+            Some(nn) => nn,
+            None => return Err(SolveError::NoSolutionFound),
+        };
+
+        let mut state_with_nonce = base_state.clone();
+        state_with_nonce.update(&nonce);
+
+        let mut rows = generate_initial_rows_96(&state_with_nonce);
+        for _ in 0..5 {
+            rows = round_96(rows);
+            if rows.is_empty() {
+                break;
+            }
+        }
+
+        for row in rows {
+            if row.indices_len != 32 {
+                continue;
+            }
+            if !row.hash[..row.hash_len].iter().all(|&b| b == 0) {
+                continue;
+            }
+            let compressed = compress_indices(96, 5, &row.indices[..row.indices_len]);
+            if equihash::is_valid_solution(96, 5, input, &nonce, &compressed).is_ok() {
+                return Ok(Solution {
+                    nonce,
+                    soln_indices: compressed,
+                });
+            }
+        }
+    }
 }
 
 fn compress_indices(n: u32, k: u32, indices: &[u32]) -> Vec<u8> {
@@ -175,7 +337,12 @@ fn compress_indices(n: u32, k: u32, indices: &[u32]) -> Vec<u8> {
 /// final round, scan remaining rows for one whose residual hash is all
 /// zero — that's a candidate solution. Re-verify via `equihash::is_valid_solution`
 /// before returning.
-pub fn solve<F>(n: u32, k: u32, input: &[u8; I_LEN], mut next_nonce: F) -> Result<Solution, SolveError>
+pub fn solve<F>(
+    n: u32,
+    k: u32,
+    input: &[u8; I_LEN],
+    mut next_nonce: F,
+) -> Result<Solution, SolveError>
 where
     F: FnMut() -> Option<[u8; 32]>,
 {
@@ -183,8 +350,11 @@ where
         return Err(SolveError::InvalidParams);
     }
 
+    if n == 96 && k == 5 {
+        return solve_96_5(input, next_nonce);
+    }
+
     let cbits = cbits_of(n, k);
-    let cbytes = cbytes_of(n, k);
     let hash_output = hash_output_len(n) as u8;
     let n_init: u32 = 1u32 << (cbits + 1);
 
@@ -200,12 +370,7 @@ where
         let mut state_with_nonce = base_state.clone();
         state_with_nonce.update(&nonce);
 
-        let mut rows: Vec<Row> = (0..n_init)
-            .map(|i| Row {
-                hash: generate_leaf_hash(&state_with_nonce, n, i),
-                indices: vec![i],
-            })
-            .collect();
+        let mut rows: Vec<Row> = generate_initial_rows(&state_with_nonce, n, n_init);
 
         for _ in 0..k {
             rows = round(rows, cbits);
