@@ -9,6 +9,7 @@
 //!                --keypair ~/.config/solana/id.json \
 //!                --max-blocks 100
 
+use std::env;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,10 +39,9 @@ use solana_sdk::transaction::Transaction;
 #[derive(Parser, Debug)]
 #[command(version, about = "Equium reference CPU miner")]
 struct Args {
-    /// RPC endpoint URL. Defaults to the public mainnet endpoint, which
-    /// rate-limits aggressively under sustained load — use a Helius / Triton
-    /// key for real mining.
-    #[arg(long, default_value = "https://api.mainnet-beta.solana.com")]
+    /// RPC endpoint URL. Defaults to HELIUS_RPC_URL, or builds a Helius mainnet
+    /// endpoint from HELIUS_API_KEY. Falls back to the public mainnet endpoint.
+    #[arg(long, default_value_t = default_rpc_url(), hide_default_value = true)]
     rpc_url: String,
 
     /// Path to a keypair JSON for the miner wallet.
@@ -371,6 +371,25 @@ struct WorkerSolve {
     solution: Option<equihash_core::solver::Solution>,
     attempts: u64,
     under_target: bool,
+}
+
+const PUBLIC_MAINNET_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
+const HELIUS_MAINNET_RPC_PREFIX: &str = "https://mainnet.helius-rpc.com/?api-key=";
+
+fn default_rpc_url() -> String {
+    match env::var("HELIUS_RPC_URL") {
+        Ok(url) if !url.trim().is_empty() => return url,
+        _ => {}
+    }
+
+    match env::var("HELIUS_API_KEY") {
+        Ok(key) if !key.trim().is_empty() => {
+            return format!("{}{}", HELIUS_MAINNET_RPC_PREFIX, key.trim());
+        }
+        _ => {}
+    }
+
+    PUBLIC_MAINNET_RPC_URL.to_string()
 }
 
 fn effective_worker_count(requested: usize) -> usize {
